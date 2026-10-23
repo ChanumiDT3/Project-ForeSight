@@ -1,70 +1,62 @@
-"""HTTP controllers; business operations delegate to transaction-scoped services.
-
-Sign-in is out of MVP scope (DL-10): there is no sign-in flow, identity
-provider, bearer token, or session. Every business endpoint still needs a role,
-a plant scope and an acting person (DL-01, minimal audit), but how a request
-supplies them is unresolved (D-35, D-36). Until that is decided these endpoints
-return ``501 rule_unresolved`` rather than inventing a role picker, shared
-account, fixed device role, or anonymous access.
-"""
+"""HTTP controllers for the finalized ForeSight maintenance API."""
 import hashlib
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from sqlalchemy import select
 
-from app import cases, equipment, readings
-from app.core import CONTEXT_QUESTIONS, ROLES, AppError, RequestContext, held
-from app.models import Alert, Breach, CommandReceipt, Machine, Parameter, Reading, WorkOrder
+from app import cases, dashboard as dashboard_service, equipment, readings, work_orders
+from app.core import AppError, RequestContext
+from app.identity import configured_plant, get_current_user
+from app.models import Alert, Breach, CommandReceipt, Parameter, Reading, User, WorkOrder
 from app.schemas import (
-    CriticalityInput, EquipmentDetailsInput, MachineInput, Page, ReadingInput,
-    ReasonInput, Result, SuggestedActionInput, ThresholdInput,
+    AddendumInput,
+    ClosureInput,
+    CriticalityInput,
+    CumulativeInput,
+    EquipmentDetailsInput,
+    MachineInput,
+    NewParameterInput,
+    Page,
+    PartsChecklistInput,
+    ReadingInput,
+    ReasonInput,
+    Result,
+    SuggestedActionInput,
+    ThresholdInput,
+    WorkOrderEditInput,
 )
 from app.storage import Repository, serialize, transaction
 
 router = APIRouter(prefix="/v1")
+public_router = APIRouter()
+
+Current = Annotated[RequestContext, Depends(get_current_user)]
+Offset = Annotated[int, Query(ge=0)]
+Limit = Annotated[int, Query(ge=1, le=100)]
+WorkOrderStatus = Literal["Open", "In Progress", "Closed", "Cancelled"]
 
 
 # PUBLIC_INTERFACE
-def request_context(request: Request) -> RequestContext:
-    """Obtain the request's role, plant scope and actor, or hold on D-35/D-36.
-
-    ``app.state.context_resolver`` is an injection point for a future, decided
-    mechanism. None exists, so the default is to refuse with 501 citing D-35 and
-    D-36. A resolver may raise ``AppError`` itself; whether requests without a
-    known role or actor are rejected is part of the held decisions.
-    """
-    resolver = request.app.state.context_resolver
-    if resolver is None:
-        held(*CONTEXT_QUESTIONS)
-    context = resolver(request)
-    if (not isinstance(context, RequestContext) or not context.actor or
-            not context.plant_id or context.role not in ROLES):
-        # A resolver contract violation is a server defect, not a client error.
-        raise AppError(500, "request_context_invalid", "Request context resolver returned invalid data")
-    return context
-
-
-# PUBLIC_INTERFACE
-def engineer(context: Annotated[RequestContext, Depends(request_context)]):
-    """Require the decided Engineer role before invoking a command."""
+def engineer(context: Current):
+    """Require the Engineer role for mutations outside reading entry."""
     if context.role != "Engineer":
         raise AppError(403, "forbidden", "Engineer role required")
     return context
 
 
 # PUBLIC_INTERFACE
-def case_reader(context: Annotated[RequestContext, Depends(request_context)]):
-    """Allow only Engineer and Manager case queries."""
+def case_reader(context: Current):
+    """Allow Engineers and Managers to read case, machine, and dashboard data."""
     if context.role not in {"Engineer", "Manager"}:
-        raise AppError(403, "forbidden", "Case access requires Engineer or Manager")
+        raise AppError(403, "forbidden", "Requires Engineer or Manager")
     return context
 
 
 # PUBLIC_INTERFACE
-def reading_writer(context: Annotated[RequestContext, Depends(request_context)]):
-    """Allow Operator and Engineer to log readings."""
+def reading_writer(context: Current):
+    """Allow Operators and Engineers to log readings."""
     if context.role not in {"Operator", "Engineer"}:
         raise AppError(403, "forbidden", "Reading entry requires Operator or Engineer")
     return context
@@ -72,7 +64,7 @@ def reading_writer(context: Annotated[RequestContext, Depends(request_context)])
 
 # PUBLIC_INTERFACE
 def command_key(value: Annotated[str, Header(alias="Idempotency-Key")]):
-    """Require a bounded, nonblank technical retry key on every mutation."""
+    """Require a bounded retry key for every mutation."""
     if not value.strip() or len(value) > 200:
         raise AppError(422, "invalid_idempotency_key", "Use a nonblank key of at most 200 characters")
     return value
@@ -80,18 +72,18 @@ def command_key(value: Annotated[str, Header(alias="Idempotency-Key")]):
 
 # PUBLIC_INTERFACE
 def version(value: Annotated[str, Header(alias="If-Match")]):
-    """Parse a quoted positive entity version used for stale-write protection."""
+    """Parse a quoted positive If-Match work-order or alert version."""
     if not (value.startswith('"') and value.endswith('"') and value[1:-1].isdigit()):
         raise AppError(422, "invalid_version", 'If-Match must be a quoted integer, for example "1"')
-    number = int(value[1:-1])
-    if number < 1:
+    parsed = int(value[1:-1])
+    if parsed < 1:
         raise AppError(422, "invalid_version", "Version must be positive")
-    return number
+    return parsed
 
 
 # PUBLIC_INTERFACE
 def database(request: Request):
-    """Require explicit database configuration; never create an implicit database."""
+    """Return the configured database engine or a safe configuration problem."""
     if request.app.state.engine is None:
         raise AppError(503, "database_unconfigured", "FORESIGHT_DATABASE_URL must be configured")
     return request.app.state.engine
@@ -99,268 +91,606 @@ def database(request: Request):
 
 # PUBLIC_INTERFACE
 def execute(request: Request, context: RequestContext, key: str, payload: dict, operation):
-    """Atomically replay or execute a command, detecting key/body mismatches."""
-    fingerprint = hashlib.sha256(json.dumps(
-        payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    scope = hashlib.sha256(json.dumps([
-        context.plant_id, context.actor, context.role, request.method, request.url.path, key
-    ]).encode()).hexdigest()
+    """Run or replay one idempotent transactional command."""
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    scope = hashlib.sha256(
+        json.dumps(
+            [
+                context.plant_id,
+                context.actor,
+                context.role,
+                request.method,
+                request.url.path,
+                key,
+            ]
+        ).encode()
+    ).hexdigest()
+
     with transaction(database(request), write=True) as session:
         receipt = session.get(CommandReceipt, scope)
         if receipt:
             if receipt.fingerprint != fingerprint:
                 raise AppError(409, "idempotency_conflict", "Retry key was used with different input")
             return Result(data=receipt.result)
+
         result = operation(session)
-        session.add(CommandReceipt(
-            scope=scope, fingerprint=fingerprint, result=result,
-            plant_id=context.plant_id, created_by=context.actor))
+        session.add(
+            CommandReceipt(
+                scope=scope,
+                fingerprint=fingerprint,
+                result=result,
+                plant_id=context.plant_id,
+                created_by=context.actor,
+            )
+        )
         session.flush()
         return Result(data=result)
 
 
 # PUBLIC_INTERFACE
-def collection(request: Request, context: RequestContext, model, offset: int, limit: int,
-               *conditions, order=(), view=serialize):
-    """Query a scoped page without giving repositories commit ownership."""
+def collection(request: Request, context, model, offset, limit, *conditions, order=(), view=serialize):
+    """Return a plant-scoped bounded collection from one consistent snapshot."""
     with transaction(database(request)) as session:
         rows, total = Repository(session, context.plant_id).page(
-            model, offset, limit, *conditions, order=order)
+            model, offset, limit, *conditions, order=order
+        )
         return Page(data=[view(row) for row in rows], total=total, offset=offset, limit=limit)
 
 
-Offset = Annotated[int, Query(ge=0)]
-Limit = Annotated[int, Query(ge=1, le=100)]
-User = Annotated[RequestContext, Depends(case_reader)]
+Reader = Annotated[RequestContext, Depends(case_reader)]
 Engineer = Annotated[RequestContext, Depends(engineer)]
 Key = Annotated[str, Depends(command_key)]
+Version = Annotated[int, Depends(version)]
 
 
 # PUBLIC_INTERFACE
-@router.post("/machines", tags=["Equipment"], response_model=Result, status_code=201,
-             summary="Register equipment", description="Save equipment and configured parameters atomically.")
+@public_router.get("/health", tags=["Users"], summary="Health check")
+def health():
+    """Return a public liveness response without accessing storage."""
+    return {"status": "ok"}
+
+
+# PUBLIC_INTERFACE
+@public_router.get("/v1/users", tags=["Users"], response_model=Page, summary="List active users")
+def list_users(request: Request, offset: Offset = 0, limit: Limit = 100):
+    """Return only ID, name, and role for active identity-popup choices."""
+    plant_id = configured_plant(request)
+    with transaction(database(request)) as session:
+        rows, total = Repository(session, plant_id).page(
+            User,
+            offset,
+            limit,
+            User.active.is_(True),
+            order=(User.name, User.id),
+        )
+        return Page(
+            data=[{"id": user.id, "name": user.name, "role": user.role} for user in rows],
+            total=total,
+            offset=offset,
+            limit=limit,
+        )
+
+
+# PUBLIC_INTERFACE
+@router.get("/me", tags=["Users"], response_model=Result, summary="Get current user")
+def me(user: Current):
+    """Return the server-resolved identity, role, and configured plant."""
+    return Result(
+        data={
+            "id": user.actor,
+            "name": user.name,
+            "role": user.role,
+            "plant_id": user.plant_id,
+        }
+    )
+
+
+# PUBLIC_INTERFACE
+@router.get("/users/directory", tags=["Users"], response_model=Page, summary="Display user directory")
+def user_directory(request: Request, user: Current, offset: Offset = 0, limit: Limit = 100):
+    """Return all users for audit/assignee name resolution after identity validation."""
+    return collection(
+        request,
+        user,
+        User,
+        offset,
+        limit,
+        order=(User.name, User.id),
+        view=lambda row: {
+            "id": row.id,
+            "name": row.name,
+            "role": row.role,
+            "active": row.active,
+        },
+    )
+
+
+# PUBLIC_INTERFACE
+@router.post("/machines", tags=["Equipment"], response_model=Result, status_code=201)
 def register_machine(request: Request, body: MachineInput, user: Engineer, key: Key):
-    """Accept equipment configuration and return the new machine and parameters."""
-    return execute(request, user, key, body.model_dump(mode="json"), lambda session:
-                   equipment.register(session, user, body, request.app.state.rules))
+    """Register equipment and zero or more configured parameters."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: equipment.register(session, user, body, request.app.state.rules),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.get("/machines", tags=["Equipment"], response_model=Page,
-            summary="List equipment", description="Return a plant-scoped, bounded equipment page.")
-def list_machines(request: Request, user: User, offset: Offset = 0, limit: Limit = 50):
-    """Return equipment ordered by plant equipment identifier."""
-    return collection(request, user, Machine, offset, limit, order=(Machine.equipment_id,))
+@router.get("/machines", tags=["Equipment"], response_model=Page)
+def list_machines(request: Request, user: Reader, offset: Offset = 0, limit: Limit = 50):
+    """List machine records with monitoring state and derived risk status."""
+    with transaction(database(request)) as session:
+        data, total = equipment.machine_page(session, user, offset, limit)
+        return Page(data=data, total=total, offset=offset, limit=limit)
 
 
 # PUBLIC_INTERFACE
-@router.get("/machines/{identifier}", tags=["Equipment"], response_model=Result,
-            summary="Equipment detail", description="Include derived status and nonpersisted runtime counter.")
-def get_machine(request: Request, identifier: str, user: User):
-    """Return one machine by internal UUID in the request context's plant."""
+@router.get("/machines/{identifier}", tags=["Equipment"], response_model=Result)
+def get_machine(request: Request, identifier: str, user: Reader):
+    """Return detailed machine information and reading/baseline context."""
     with transaction(database(request)) as session:
         return Result(data=equipment.machine_detail(session, user, identifier))
 
 
 # PUBLIC_INTERFACE
-@router.get("/machines/{identifier}/status", tags=["Cases"], response_model=Result,
-            summary="Derived machine status", description="Read authoritative alerts; no persisted status projection.")
-def machine_status(request: Request, identifier: str, user: User):
-    """Return Healthy or At Risk and active alert count for one machine."""
+@router.get("/machines/{identifier}/status", tags=["Cases"], response_model=Result)
+def machine_status(request: Request, identifier: str, user: Reader):
+    """Return a machine's derived health status and active alert count."""
     with transaction(database(request)) as session:
         detail = equipment.machine_detail(session, user, identifier)
-        return Result(data={k: detail[k] for k in ("status", "active_alert_count")})
+        return Result(
+            data={
+                "status": detail["status"],
+                "active_alert_count": detail["active_alert_count"],
+            }
+        )
 
 
 # PUBLIC_INTERFACE
-@router.patch("/machines/{identifier}", tags=["Equipment"], response_model=Result,
-              summary="Edit equipment details", description="Update descriptive fields with actor and UTC time.")
-def equipment_details(request: Request, identifier: str, body: EquipmentDetailsInput,
-                      user: Engineer, key: Key):
-    """Accept descriptive equipment fields and return the updated plant-scoped record."""
-    return execute(request, user, key, body.model_dump(mode="json"), lambda session:
-                   equipment.edit_details(session, user, identifier, body))
+@router.patch("/machines/{identifier}", tags=["Equipment"], response_model=Result)
+def equipment_details(
+    request: Request,
+    identifier: str,
+    body: EquipmentDetailsInput,
+    user: Engineer,
+    key: Key,
+):
+    """Edit descriptive equipment fields."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: equipment.edit_details(session, user, identifier, body),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.patch("/parameters/{identifier}/suggested-action", tags=["Equipment"], response_model=Result,
-              summary="Edit parameter action", description="Update guidance text for future alerts.")
-def suggested_action(request: Request, identifier: str, body: SuggestedActionInput,
-                     user: Engineer, key: Key):
-    """Accept parameter action text and return the attributed parameter record."""
-    return execute(request, user, key, body.model_dump(mode="json"), lambda session:
-                   equipment.edit_suggested_action(session, user, identifier, body))
+@router.post("/machines/{identifier}/parameters", tags=["Equipment"], response_model=Result, status_code=201)
+def add_parameter(
+    request: Request,
+    identifier: str,
+    body: NewParameterInput,
+    user: Engineer,
+    key: Key,
+):
+    """Add a parameter to an already registered machine."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: equipment.add_parameter(session, user, identifier, body, request.app.state.rules),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.patch("/machines/{identifier}/criticality", tags=["Equipment"], response_model=Result,
-              summary="Edit criticality", description="Affects future evaluations only.")
-def criticality(request: Request, identifier: str, body: CriticalityInput, user: Engineer, key: Key):
-    """Update machine criticality and return the attributed record."""
-    return execute(request, user, key, body.model_dump(mode="json"), lambda session:
-                   equipment.edit_criticality(session, user, identifier, body))
+@router.patch("/parameters/{identifier}/cumulative", tags=["Equipment"], response_model=Result)
+def cumulative(request: Request, identifier: str, body: CumulativeInput, user: Engineer, key: Key):
+    """Change a custom parameter's cumulative flag before its first reading."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: equipment.edit_cumulative(session, user, identifier, body),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.patch("/parameters/{identifier}/threshold", tags=["Equipment"], response_model=Result,
-              summary="Edit maximum threshold", description="Existing alerts and breaches remain unchanged.")
-def threshold(request: Request, identifier: str, body: ThresholdInput, user: Engineer, key: Key):
-    """Update a configured parameter's safe maximum and return its record."""
-    return execute(request, user, key, body.model_dump(mode="json"), lambda session:
-                   equipment.edit_threshold(session, user, identifier, body))
+@router.patch("/parameters/{identifier}/suggested-action", tags=["Equipment"], response_model=Result)
+def suggested_action(
+    request: Request,
+    identifier: str,
+    body: SuggestedActionInput,
+    user: Engineer,
+    key: Key,
+):
+    """Update a parameter's future alert suggested action."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: equipment.edit_suggested_action(session, user, identifier, body),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.post("/readings", tags=["Readings"], response_model=Result, status_code=201,
-             summary="Log one reading", description="Validate, detect and consolidate alerts in one durable transaction.")
-def log_reading(request: Request, body: ReadingInput,
-                user: Annotated[RequestContext, Depends(reading_writer)], key: Key):
-    """Accept one parameter value; return saved reading and associated alert ID."""
-    return execute(request, user, key, body.model_dump(mode="json"), lambda session:
-                   readings.log_reading(session, user, body, request.app.state.rules))
+@router.patch("/machines/{identifier}/criticality", tags=["Equipment"], response_model=Result)
+def criticality(
+    request: Request,
+    identifier: str,
+    body: CriticalityInput,
+    user: Engineer,
+    key: Key,
+):
+    """Update criticality for future alert calculation."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: equipment.edit_criticality(session, user, identifier, body),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.get("/parameters/{identifier}/readings", tags=["Readings"], response_model=Page,
-            summary="Immutable reading history", description="List timestamped readings; no edit or delete interface exists.")
-def reading_history(request: Request, identifier: str, user: User,
-                    offset: Offset = 0, limit: Limit = 50):
-    """Return ascending reading history for an existing plant-scoped parameter."""
+@router.patch("/parameters/{identifier}/threshold", tags=["Equipment"], response_model=Result)
+def threshold(
+    request: Request,
+    identifier: str,
+    body: ThresholdInput,
+    user: Engineer,
+    key: Key,
+):
+    """Update a maximum threshold for future readings."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: equipment.edit_threshold(session, user, identifier, body),
+    )
+
+
+# PUBLIC_INTERFACE
+@router.get("/readings/targets", tags=["Readings"], response_model=Page)
+def reading_targets(
+    request: Request,
+    user: Annotated[RequestContext, Depends(reading_writer)],
+    offset: Offset = 0,
+    limit: Limit = 100,
+):
+    """Return validated reading-entry targets to Operators and Engineers."""
+    with transaction(database(request)) as session:
+        data, total = equipment.reading_targets(session, user, offset, limit)
+        return Page(data=data, total=total, offset=offset, limit=limit)
+
+
+# PUBLIC_INTERFACE
+@router.post("/readings", tags=["Readings"], response_model=Result, status_code=201)
+def log_reading(
+    request: Request,
+    body: ReadingInput,
+    user: Annotated[RequestContext, Depends(reading_writer)],
+    key: Key,
+):
+    """Log one reading and return its optional alert link."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: readings.log_reading(session, user, body, request.app.state.rules),
+    )
+
+
+# PUBLIC_INTERFACE
+@router.get("/parameters/{identifier}/readings", tags=["Readings"], response_model=Page)
+def reading_history(
+    request: Request,
+    identifier: str,
+    user: Reader,
+    offset: Offset = 0,
+    limit: Limit = 50,
+):
+    """Return immutable chronological readings for a parameter."""
     with transaction(database(request)) as session:
         repo = Repository(session, user.plant_id)
         repo.get(Parameter, identifier)
         rows, total = repo.page(
-            Reading, offset, limit, Reading.parameter_id == identifier,
-            order=(Reading.created_at, Reading.id))
+            Reading,
+            offset,
+            limit,
+            Reading.parameter_id == identifier,
+            order=(Reading.created_at, Reading.id),
+        )
         return Page(data=[serialize(row) for row in rows], total=total, offset=offset, limit=limit)
 
 
 # PUBLIC_INTERFACE
-@router.get("/alerts", tags=["Cases"], response_model=Page,
-            summary="Alert queue", description="Fixed priority-score descending, earliest-breach ascending ordering.")
-def alert_queue(request: Request, user: User, offset: Offset = 0, limit: Limit = 50):
-    """Return all alerts including final alerts; optional filters are deferred."""
-    return collection(request, user, Alert, offset, limit, order=(
-        Alert.priority_score.desc(), Alert.first_breach_at, Alert.id), view=cases.alert_view)
+@router.get("/alerts", tags=["Cases"], response_model=Page)
+def alert_queue(request: Request, user: Reader, offset: Offset = 0, limit: Limit = 50):
+    """Return queue alerts ordered by priority then first breach time."""
+    with transaction(database(request)) as session:
+        rows, total = Repository(session, user.plant_id).page(
+            Alert,
+            offset,
+            limit,
+            order=(Alert.priority_score.desc(), Alert.first_breach_at, Alert.id),
+        )
+        return Page(
+            data=cases.alert_views(session, user, rows, request.app.state.rules),
+            total=total,
+            offset=offset,
+            limit=limit,
+        )
 
 
 # PUBLIC_INTERFACE
-@router.get("/alerts/{identifier}", tags=["Cases"], response_model=Result,
-            summary="Alert detail", description="Include stored score and explicit held display rules.")
-def alert_detail(request: Request, identifier: str, user: User):
-    """Return an alert and its existing linked work-order IDs."""
+@router.get("/alerts/{identifier}", tags=["Cases"], response_model=Result)
+def alert_detail(request: Request, identifier: str, user: Reader):
+    """Return alert detail and linked work-order identifiers."""
     with transaction(database(request)) as session:
         alert = Repository(session, user.plant_id).get(Alert, identifier)
-        linked = session.scalars(select(WorkOrder.id).where(
-            WorkOrder.alert_id == identifier, WorkOrder.plant_id == user.plant_id)).all()
-        return Result(data=dict(**cases.alert_view(alert), work_order_ids=list(linked)))
+        work_order_ids = session.scalars(
+            select(WorkOrder.id)
+            .where(
+                WorkOrder.alert_id == identifier,
+                WorkOrder.plant_id == user.plant_id,
+            )
+            .order_by(WorkOrder.created_at)
+        ).all()
+        view = cases.alert_views(session, user, [alert], request.app.state.rules)[0]
+        return Result(data={**view, "work_order_ids": list(work_order_ids)})
 
 
 # PUBLIC_INTERFACE
-@router.get("/alerts/{identifier}/breaches", tags=["Cases"], response_model=Page,
-            summary="Breach history", description="Every breaching reading retains its own evaluation snapshot.")
-def breach_history(request: Request, identifier: str, user: User,
-                   offset: Offset = 0, limit: Limit = 50):
-    """Return the immutable chronological breach history of an existing alert."""
+@router.get("/alerts/{identifier}/breaches", tags=["Cases"], response_model=Page)
+def breach_history(
+    request: Request,
+    identifier: str,
+    user: Reader,
+    offset: Offset = 0,
+    limit: Limit = 50,
+):
+    """Return immutable breach snapshots for an alert."""
     with transaction(database(request)) as session:
         repo = Repository(session, user.plant_id)
         repo.get(Alert, identifier)
         rows, total = repo.page(
-            Breach, offset, limit, Breach.alert_id == identifier,
-            order=(Breach.created_at, Breach.id))
+            Breach,
+            offset,
+            limit,
+            Breach.alert_id == identifier,
+            order=(Breach.created_at, Breach.id),
+        )
         return Page(data=[serialize(row) for row in rows], total=total, offset=offset, limit=limit)
 
 
 # PUBLIC_INTERFACE
-@router.post("/alerts/{identifier}/dismissal", tags=["Cases"], response_model=Result,
-             summary="Dismiss an Open alert", description="Require Engineer, free-text reason, retry key and If-Match version.")
-def dismiss_alert(request: Request, identifier: str, body: ReasonInput, user: Engineer, key: Key,
-                  expected: Annotated[int, Depends(version)]):
-    """Dismiss a plant-scoped alert and return its new state and version."""
-    payload = dict(**body.model_dump(mode="json"), version=expected)
-    return execute(request, user, key, payload, lambda session:
-                   cases.dismiss(session, user, identifier, body.reason, expected))
+@router.post("/alerts/{identifier}/dismissal", tags=["Cases"], response_model=Result)
+def dismiss_alert(
+    request: Request,
+    identifier: str,
+    body: ReasonInput,
+    user: Engineer,
+    key: Key,
+    expected: Version,
+):
+    """Dismiss an Open alert without active work."""
+    payload = {**body.model_dump(mode="json"), "version": expected}
+    return execute(
+        request,
+        user,
+        key,
+        payload,
+        lambda session: cases.dismiss(
+            session,
+            user,
+            identifier,
+            body.reason,
+            expected,
+            request.app.state.rules,
+        ),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.post("/alerts/{identifier}/work-orders", tags=["Work orders"], response_model=Result,
-             summary="Work-order creation (held)", description="No writes until due-day basis and label ownership are decided.")
-def create_work_order(identifier: str, user: Engineer, key: Key):
-    """Hold creation rather than invent calendar-day defaults or label ownership."""
-    held("D-10: calendar versus working days", "CM-Q8")
+@router.post("/alerts/{identifier}/work-orders", tags=["Work orders"], response_model=Result, status_code=201)
+def create_work_order(request: Request, identifier: str, user: Engineer, key: Key):
+    """Create an Open work order from an Open alert."""
+    return execute(
+        request,
+        user,
+        key,
+        {"alert_id": identifier},
+        lambda session: work_orders.create(session, user, identifier, request.app.state.rules),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.get("/work-orders", tags=["Work orders"], response_model=Page,
-            summary="Work-order list", description="Paginated plant-scoped persisted work orders.")
-def work_orders(request: Request, user: User, offset: Offset = 0, limit: Limit = 50):
-    """Return work-order records in creation order."""
-    return collection(request, user, WorkOrder, offset, limit, order=(WorkOrder.created_at, WorkOrder.id))
+@router.get("/work-orders", tags=["Work orders"], response_model=Page)
+def list_work_orders(
+    request: Request,
+    user: Reader,
+    offset: Offset = 0,
+    limit: Limit = 50,
+    status: WorkOrderStatus | None = None,
+    assignee: str | None = None,
+):
+    """List work orders with status and assignee filters for the React UI."""
+    conditions = []
+    if status:
+        conditions.append(WorkOrder.status == status)
+    if assignee:
+        conditions.append(WorkOrder.assignee == assignee)
+    return collection(
+        request,
+        user,
+        WorkOrder,
+        offset,
+        limit,
+        *conditions,
+        order=(WorkOrder.created_at, WorkOrder.id),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.get("/work-orders/{identifier}", tags=["Work orders"], response_model=Result,
-            summary="Work-order detail", description="Read a plant-scoped work order without mutation.")
-def work_order(request: Request, identifier: str, user: User):
-    """Return one work order by UUID."""
+@router.get("/work-orders/{identifier}", tags=["Work orders"], response_model=Result)
+def get_work_order(request: Request, identifier: str, user: Reader):
+    """Return one work order including closure/runtime information and addenda."""
     with transaction(database(request)) as session:
-        return Result(data=serialize(Repository(session, user.plant_id).get(WorkOrder, identifier)))
+        work_order = Repository(session, user.plant_id).get(WorkOrder, identifier)
+        return Result(data=work_orders.work_order_view(session, user, work_order, include_addenda=True))
 
 
 # PUBLIC_INTERFACE
-@router.patch("/work-orders/{identifier}", tags=["Work orders"], response_model=Result,
-              summary="Edit work order (held)", description="Object-level authorization and assignee eligibility remain open.")
-def edit_work_order(identifier: str, user: Engineer, key: Key):
-    """Hold edits pending CM-Q4 and CM-Q7; do not infer any-Engineer permission."""
-    held("CM-Q4", "CM-Q7")
+@router.patch("/work-orders/{identifier}", tags=["Work orders"], response_model=Result)
+def edit_work_order(
+    request: Request,
+    identifier: str,
+    body: WorkOrderEditInput,
+    user: Engineer,
+    key: Key,
+    expected: Version,
+):
+    """Edit assignment, due date, or scheduled-service state."""
+    payload = {**body.model_dump(mode="json", exclude_unset=True), "version": expected}
+    return execute(
+        request,
+        user,
+        key,
+        payload,
+        lambda session: work_orders.edit(session, user, identifier, body, expected),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.post("/work-orders/{identifier}/start", tags=["Work orders"], response_model=Result,
-             summary="Start work order (held)", description="Object-level mutation authorization is not settled.")
-def start_work_order(identifier: str, user: Engineer, key: Key):
-    """Hold mutation until work-order object policy is decided."""
-    held("CM-Q4")
+@router.post("/work-orders/{identifier}/start", tags=["Work orders"], response_model=Result)
+def start_work_order(
+    request: Request,
+    identifier: str,
+    user: Engineer,
+    key: Key,
+    expected: Version,
+):
+    """Start an Open work order."""
+    return execute(
+        request,
+        user,
+        key,
+        {"version": expected},
+        lambda session: work_orders.start(session, user, identifier, expected),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.post("/work-orders/{identifier}/cancellation", tags=["Work orders"], response_model=Result,
-             summary="Cancel work order (held)", description="Cancellation requires a reason; object policy remains held.")
-def cancel_work_order(identifier: str, body: ReasonInput, user: Engineer, key: Key):
-    """Validate nonblank reason without choosing the unresolved object policy."""
-    held("CM-Q4")
+@router.post("/work-orders/{identifier}/cancellation", tags=["Work orders"], response_model=Result)
+def cancel_work_order(
+    request: Request,
+    identifier: str,
+    body: ReasonInput,
+    user: Engineer,
+    key: Key,
+    expected: Version,
+):
+    """Cancel an active work order and reopen its alert."""
+    payload = {**body.model_dump(mode="json"), "version": expected}
+    return execute(
+        request,
+        user,
+        key,
+        payload,
+        lambda session: work_orders.cancel(session, user, identifier, body.reason, expected),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.put("/work-orders/{identifier}/parts-checklist", tags=["Work orders"], response_model=Result,
-            summary="Parts checklist (held)", description="Quantity lower bound and object authorization are unresolved.")
-def parts_checklist(identifier: str, user: Engineer, key: Key):
-    """Hold checklist updates rather than invent a quantity lower bound."""
-    held("CM-Q4", "CM-Q5")
+@router.put("/work-orders/{identifier}/parts-checklist", tags=["Work orders"], response_model=Result)
+def parts_checklist(
+    request: Request,
+    identifier: str,
+    body: PartsChecklistInput,
+    user: Engineer,
+    key: Key,
+    expected: Version,
+):
+    """Replace an active work order's optional parts checklist."""
+    payload = {**body.model_dump(mode="json"), "version": expected}
+    return execute(
+        request,
+        user,
+        key,
+        payload,
+        lambda session: work_orders.replace_checklist(session, user, identifier, body, expected),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.post("/work-orders/{identifier}/closure", tags=["Work orders"], response_model=Result,
-             summary="Close work order (held)", description="No partial closure writes are performed while policy is unresolved.")
-def close_work_order(identifier: str, user: Engineer, key: Key):
-    """Hold closure pending authorization and runtime closure decisions."""
-    held("CM-Q4", "D-13", "D-26", "D-30")
+@router.post("/work-orders/{identifier}/closure", tags=["Work orders"], response_model=Result)
+def close_work_order(
+    request: Request,
+    identifier: str,
+    body: ClosureInput,
+    user: Engineer,
+    key: Key,
+    expected: Version,
+):
+    """Close an In Progress order and apply validated service effects atomically."""
+    payload = {**body.model_dump(mode="json"), "version": expected}
+    return execute(
+        request,
+        user,
+        key,
+        payload,
+        lambda session: work_orders.close(session, user, identifier, body, expected),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.post("/work-orders/{identifier}/addenda", tags=["Work orders"], response_model=Result,
-             summary="Closed-work-order addendum (held)", description="Object-level write policy remains unresolved.")
-def addendum(identifier: str, user: Engineer, key: Key):
-    """Hold addendum writes pending work-order object authorization."""
-    held("CM-Q4")
+@router.post("/work-orders/{identifier}/addenda", tags=["Work orders"], response_model=Result, status_code=201)
+def addendum(
+    request: Request,
+    identifier: str,
+    body: AddendumInput,
+    user: Engineer,
+    key: Key,
+):
+    """Append an insert-only note to a Closed work order."""
+    return execute(
+        request,
+        user,
+        key,
+        body.model_dump(mode="json"),
+        lambda session: work_orders.add_addendum(session, user, identifier, body.note),
+    )
 
 
 # PUBLIC_INTERFACE
-@router.get("/dashboard", tags=["Dashboard"], response_model=Result,
-            summary="Dashboard (held)", description="Location/type composition awaits definition of open work orders.")
-def dashboard(user: Annotated[RequestContext, Depends(request_context)],
-              location: str | None = None, equipment_type: str | None = None):
-    """Expose Manager prerequisite without granting undecided access to other roles."""
-    if user.role != "Manager":
-        held("D-17")
-    held("D-31")
+@router.get("/dashboard", tags=["Dashboard"], response_model=Result)
+def dashboard(
+    request: Request,
+    user: Reader,
+    location: str | None = None,
+    equipment_type: str | None = None,
+    limit: Limit = 100,
+):
+    """Return the Manager/Engineer read-only dashboard."""
+    with transaction(database(request)) as session:
+        return Result(
+            data=dashboard_service.compose(
+                session,
+                user,
+                request.app.state.rules,
+                location,
+                equipment_type,
+                limit,
+            )
+        )

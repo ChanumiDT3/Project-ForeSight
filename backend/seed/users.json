@@ -1,0 +1,6 @@
+[
+  {"id": "u-priya", "name": "Priya Sharma", "email": "priya.sharma@example.com", "role": "Engineer", "active": true},
+  {"id": "u-raj", "name": "Raj Patel", "email": "raj.patel@example.com", "role": "Engineer", "active": true},
+  {"id": "u-ana", "name": "Ana Silva", "email": "ana.silva@example.com", "role": "Operator", "active": true},
+  {"id": "u-mei", "name": "Mei Chen", "email": "mei.chen@example.com", "role": "Manager", "active": true}
+]
