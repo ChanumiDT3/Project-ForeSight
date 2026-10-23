@@ -1,0 +1,16 @@
+overview:
+  project_name: Project-ForeSight
+  description: A predictive maintenance system that turns equipment sensor readings into prioritized alerts and work orders to help teams fix machines before they fail.
+  third_party_services: []
+  sessionStartupCommand: ''
+knowledge_exclude_dirs:
+  - __pycache__
+  - .pytest_cache
+  - .mypy_cache
+  - .venv
+  - venv
+  - env
+  - dist
+  - build
+  - .git
+containers: []

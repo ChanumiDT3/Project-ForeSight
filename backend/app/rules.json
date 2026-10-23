@@ -1,0 +1,11 @@
+{
+  "parameters": {
+    "temperature": {"unit": "degrees C", "minimum": "0", "maximum": "1000", "precision": 1, "cumulative": false},
+    "vibration": {"unit": "mm/s", "minimum": "0", "maximum": "200", "precision": 2, "cumulative": false},
+    "cycle_count": {"unit": "cycles", "minimum": "0", "maximum": "999999999", "precision": 0, "cumulative": true},
+    "runtime_hours": {"unit": "hours", "minimum": "0", "maximum": "200000", "precision": 1, "cumulative": true}
+  },
+  "exceedance_bands": ["10", "25"],
+  "priority_labels": {"2": "Medium", "3": "Medium", "4": "High", "5": "Critical", "6": "Critical"},
+  "due_days": {"Critical": 1, "High": 3, "Medium": 7}
+}
