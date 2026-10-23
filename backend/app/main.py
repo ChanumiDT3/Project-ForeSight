@@ -20,18 +20,25 @@ logger = logging.getLogger("foresight")
 
 
 # PUBLIC_INTERFACE
-def create_app(database_url=None, identity_verifier=None):
-    """Build an app with explicit storage and a trusted synchronous identity adapter.
+def create_app(database_url=None, context_resolver=None):
+    """Build the app with explicit storage and an optional request-context resolver.
 
-    The adapter receives a bearer token and returns a validated Identity. No local
-    passwords, caller-supplied roles, self-registration, or test bypass is exposed.
-    Request FORESIGHT_DATABASE_URL and FORESIGHT_OPERATIONAL_RECIPIENT from the
-    user through deployment configuration; this module never reads a .env file.
+    Sign-in is out of MVP scope (DL-10): no sign-in flow, identity provider,
+    bearer token or session validation exists. ``context_resolver`` is a
+    synchronous callable ``(Request) -> RequestContext`` reserved for whatever
+    mechanism answers D-35 (role and plant scope) and D-36 (record attribution).
+    No such mechanism is decided, so the default ``None`` makes every business
+    endpoint return 501 rule_unresolved. Request FORESIGHT_DATABASE_URL and
+    FORESIGHT_OPERATIONAL_RECIPIENT from the user through deployment
+    configuration; this module never reads a .env file.
     """
     app = FastAPI(
         title="ForeSight Maintenance API", version="0.1.0",
         description="Settled MVP backend. 501 rule_unresolved denotes a documented held policy. "
-                    "Identity provider integration is required before authenticated use.",
+                    "Sign-in is out of MVP scope (DL-10): there is no sign-in, identity provider "
+                    "or bearer token. How a request's role, plant scope and acting person are "
+                    "supplied is unresolved (D-35, D-36), so business endpoints return 501 "
+                    "rule_unresolved until that is decided.",
         openapi_tags=[{"name": name, "description": description} for name, description in [
             ("Equipment", "Equipment registry and maximum-only health parameters"),
             ("Readings", "Immutable readings, validation and atomic detection"),
@@ -42,7 +49,8 @@ def create_app(database_url=None, identity_verifier=None):
     )
     url = database_url or os.getenv("FORESIGHT_DATABASE_URL")
     app.state.engine = make_engine(url) if url else None
-    app.state.identity_verifier = identity_verifier
+    # No production resolver exists; None holds business endpoints on D-35/D-36.
+    app.state.context_resolver = context_resolver
     app.state.rules = json.loads(Path(__file__).with_name("rules.json").read_text())
     app.state.operational_recipient = os.getenv("FORESIGHT_OPERATIONAL_RECIPIENT")
 
@@ -57,8 +65,7 @@ def create_app(database_url=None, identity_verifier=None):
         correlation = getattr(request.state, "correlation_id", str(uuid4()))
         return JSONResponse(
             status_code=status, media_type="application/problem+json",
-            headers={"X-Correlation-ID": correlation,
-                     **({"WWW-Authenticate": "Bearer"} if status == 401 else {})},
+            headers={"X-Correlation-ID": correlation},
             content=dict(type=f"urn:foresight:problem:{code}", title=code, status=status,
                          detail=detail, instance=request.url.path, correlation_id=correlation),
         )
@@ -69,7 +76,7 @@ def create_app(database_url=None, identity_verifier=None):
 
     @app.exception_handler(RequestValidationError)
     async def _validation(request: Request, error: RequestValidationError):
-        # Do not echo input, request bodies, tokens, or arbitrary free text.
+        # Do not echo input, request bodies, or arbitrary free text.
         fields = [f"{'.'.join(map(str, e['loc']))}: {e['type']}" for e in error.errors()]
         return _problem(request, 422, "validation_failed", "; ".join(fields))
 
@@ -104,9 +111,10 @@ def create_app(database_url=None, identity_verifier=None):
         code: {"model": Problem, "description": description,
                "content": {"application/problem+json": {}}}
         for code, description in {
-            401: "Session missing or invalid", 403: "Role not permitted", 404: "Record not found",
+            403: "Role not permitted", 404: "Record not found",
             409: "State, version or retry conflict", 422: "Input rejected",
-            501: "Business rule unresolved", 503: "Dependency unavailable",
+            501: "Business rule unresolved, including request context (D-35, D-36)",
+            503: "Dependency unavailable",
         }.items()
     })
     return app

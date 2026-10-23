@@ -10,24 +10,28 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from app.core import Identity
+from app.core import RequestContext
 from app.domain import plain, score
 from app.main import create_app
 from app.models import Alert, Base, Breach, CommandReceipt, Machine, Parameter, Reading
 from app.storage import transaction
 
+# Test-only header naming a predefined test context. It is not a product
+# mechanism: how roles, plant scope and actors are supplied is held (D-35, D-36).
+TEST_CONTEXT_HEADER = "X-Test-Context"
+
 
 @pytest.fixture
 def client(tmp_path):
-    """Provide an isolated real SQLite database with a trusted test-only identity adapter."""
-    users = {
-        "engineer": Identity("e-1", "plant-1", "Engineer"),
-        "operator": Identity("o-1", "plant-1", "Operator"),
-        "manager": Identity("m-1", "plant-1", "Manager"),
-        "other": Identity("e-2", "plant-2", "Engineer"),
-        "inactive": Identity("e-3", "plant-1", "Engineer", False),
+    """Provide an isolated real SQLite database with a test-only request-context resolver."""
+    contexts = {
+        "engineer": RequestContext("e-1", "plant-1", "Engineer"),
+        "operator": RequestContext("o-1", "plant-1", "Operator"),
+        "manager": RequestContext("m-1", "plant-1", "Manager"),
+        "other": RequestContext("e-2", "plant-2", "Engineer"),
     }
-    app = create_app(f"sqlite:///{tmp_path / 'test.db'}", users.get)
+    app = create_app(f"sqlite:///{tmp_path / 'test.db'}",
+                     lambda request: contexts[request.headers[TEST_CONTEXT_HEADER]])
     Base.metadata.create_all(app.state.engine)
     with TestClient(app, raise_server_exceptions=False) as test_client:
         yield test_client
@@ -35,7 +39,7 @@ def client(tmp_path):
 
 
 def _headers(role="engineer", key=None, version=None):
-    headers = {"Authorization": f"Bearer {role}", "Idempotency-Key": key or str(uuid4())}
+    headers = {TEST_CONTEXT_HEADER: role, "Idempotency-Key": key or str(uuid4())}
     if version is not None:
         headers["If-Match"] = f'"{version}"'
     return headers
@@ -64,10 +68,8 @@ def _count(client, model):
 
 
 # PUBLIC_INTERFACE
-def test_roles_identity_and_plant_isolation(client):
-    """Require trusted identity, three roles, and plant isolation before access."""
-    assert client.get("/v1/machines").status_code == 401
-    assert client.get("/v1/machines", headers=_headers("inactive")).status_code == 401
+def test_roles_and_plant_isolation(client):
+    """Decided three-role permissions and plant isolation apply to the supplied context."""
     assert client.get("/v1/alerts", headers=_headers("operator")).status_code == 403
     machine = _machine(client)
     assert client.get(f"/v1/machines/{machine['id']}", headers=_headers("other")).status_code == 404
@@ -75,6 +77,46 @@ def test_roles_identity_and_plant_isolation(client):
         parameter_id=machine["parameters"][0]["id"], value=85),
         headers=_headers("manager")).status_code == 403
     assert _reading(client, machine, "85", role="operator").status_code == 201
+    with transaction(client.app.state.engine) as session:
+        reading = session.scalars(select(Reading)).one()
+    assert reading.created_by == "o-1" and reading.plant_id == "plant-1"
+
+
+# PUBLIC_INTERFACE
+def test_no_sign_in_holds_on_request_context(tmp_path):
+    """Without sign-in (DL-10) and with no decided context source, nothing is invented.
+
+    No 401 or bearer challenge is produced, a bearer token grants nothing, and
+    business endpoints hold on D-35/D-36 without writing anything.
+    """
+    app = create_app(f"sqlite:///{tmp_path / 'held.db'}")
+    Base.metadata.create_all(app.state.engine)
+    with TestClient(app, raise_server_exceptions=False) as held_client:
+        for headers in ({}, {"Authorization": "Bearer anything"}):
+            response = held_client.get("/v1/machines", headers=headers)
+            assert response.status_code == 501
+            assert response.json()["title"] == "rule_unresolved"
+            assert "D-35" in response.json()["detail"] and "D-36" in response.json()["detail"]
+            assert "WWW-Authenticate" not in response.headers
+        response = held_client.post("/v1/readings", json=dict(parameter_id="x", value="1"),
+                                    headers={"Idempotency-Key": "k"})
+        assert response.status_code == 501
+        assert held_client.get("/v1/dashboard").status_code == 501
+        assert held_client.get("/openapi.json").status_code == 200
+        assert _count(held_client, CommandReceipt) == _count(held_client, Machine) == 0
+    app.state.engine.dispose()
+
+
+# PUBLIC_INTERFACE
+def test_invalid_resolver_output_is_server_error(tmp_path):
+    """A resolver violating the RequestContext contract never yields an unscoped request."""
+    app = create_app(f"sqlite:///{tmp_path / 'bad.db'}",
+                     lambda request: RequestContext("a", "plant-1", "Admin"))
+    with TestClient(app, raise_server_exceptions=False) as bad_client:
+        response = bad_client.get("/v1/machines")
+        assert response.status_code == 500
+        assert response.json()["title"] == "request_context_invalid"
+    app.state.engine.dispose()
 
 
 # PUBLIC_INTERFACE
@@ -254,7 +296,10 @@ def test_openapi_and_pagination(client):
     spec = client.get("/openapi.json").json()
     assert spec["info"]["title"] == "ForeSight Maintenance API"
     assert "/v1/readings" in spec["paths"] and "/v1/work-orders/{identifier}/closure" in spec["paths"]
-    assert spec["components"]["securitySchemes"]["HTTPBearer"]["scheme"] == "bearer"
+    # Sign-in is out of MVP scope (DL-10): no security scheme and no 401 response.
+    assert "securitySchemes" not in spec.get("components", {})
+    assert all("401" not in operation["responses"]
+               for path in spec["paths"].values() for operation in path.values())
     assert client.get("/v1/alerts?limit=101", headers=_headers()).status_code == 422
     assert client.get("/v1/alerts?offset=-1", headers=_headers()).status_code == 422
 
@@ -267,7 +312,7 @@ def test_migration_upgrade_and_retention_guard(tmp_path, monkeypatch):
     config = Config("alembic.ini")
     command.upgrade(config, "head")
     command.upgrade(config, "head")
-    app = create_app(url, lambda token: Identity("e", "p", "Engineer"))
+    app = create_app(url, lambda request: RequestContext("e", "p", "Engineer"))
     with TestClient(app) as migrated:
         _machine(migrated)
     with pytest.raises(RuntimeError, match="Destructive downgrade"):

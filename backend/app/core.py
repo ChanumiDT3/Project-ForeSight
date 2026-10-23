@@ -3,6 +3,18 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal, NoReturn
 
+# The three decided roles (DL-01 / US-2). The permission matrix is settled; how a
+# request's role is determined without sign-in is not (D-35).
+ROLES = ("Operator", "Engineer", "Manager")
+
+# Open questions that block every business endpoint until a request-context
+# mechanism is decided. Sign-in is out of MVP scope (DL-10), so no identity
+# provider, sign-in flow, or token validation exists to supply these values.
+CONTEXT_QUESTIONS = (
+    "D-35: role and plant scope without sign-in",
+    "D-36: record attribution without sign-in",
+)
+
 
 # PUBLIC_INTERFACE
 class AppError(Exception):
@@ -17,13 +29,18 @@ class AppError(Exception):
 
 # PUBLIC_INTERFACE
 @dataclass(frozen=True)
-class Identity:
-    """Validated external subject and plant scope supplied by a trusted adapter."""
+class RequestContext:
+    """Role, plant scope and acting person a business operation needs.
 
-    subject: str
+    Sign-in is out of MVP scope (DL-10). This contract deliberately says nothing
+    about where the values come from: role and plant-scope determination is held
+    on D-35 and record attribution (``actor``) on D-36. No production source is
+    implemented; see ``app.api.request_context``.
+    """
+
+    actor: str
     plant_id: str
     role: Literal["Operator", "Engineer", "Manager"]
-    active: bool = True
 
 
 # PUBLIC_INTERFACE

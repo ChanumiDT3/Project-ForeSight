@@ -1,15 +1,21 @@
-"""HTTP controllers; business operations delegate to transaction-scoped services."""
+"""HTTP controllers; business operations delegate to transaction-scoped services.
+
+Sign-in is out of MVP scope (DL-10): there is no sign-in flow, identity
+provider, bearer token, or session. Every business endpoint still needs a role,
+a plant scope and an acting person (DL-01, minimal audit), but how a request
+supplies them is unresolved (D-35, D-36). Until that is decided these endpoints
+return ``501 rule_unresolved`` rather than inventing a role picker, shared
+account, fixed device role, or anonymous access.
+"""
 import hashlib
 import json
-import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Request
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 
 from app import cases, equipment, readings
-from app.core import AppError, Identity, held
+from app.core import CONTEXT_QUESTIONS, ROLES, AppError, RequestContext, held
 from app.models import Alert, Breach, CommandReceipt, Machine, Parameter, Reading, WorkOrder
 from app.schemas import (
     CriticalityInput, EquipmentDetailsInput, MachineInput, Page, ReadingInput,
@@ -18,54 +24,50 @@ from app.schemas import (
 from app.storage import Repository, serialize, transaction
 
 router = APIRouter(prefix="/v1")
-bearer = HTTPBearer(auto_error=False)
-logger = logging.getLogger("foresight")
 
 
 # PUBLIC_INTERFACE
-def identity(request: Request, credential: Annotated[
-    HTTPAuthorizationCredentials | None, Depends(bearer)
-]) -> Identity:
-    """Validate bearer credentials through the deployment's trusted provider adapter."""
-    if credential is None:
-        raise AppError(401, "authentication_required", "A valid bearer session is required")
-    verifier = request.app.state.identity_verifier
-    if verifier is None:
-        raise AppError(503, "identity_unconfigured", "Identity provider integration is not configured")
-    try:
-        user = verifier(credential.credentials)
-    except Exception as error:
-        # Never log the credential itself; the error type is enough for diagnosis.
-        logger.warning(json.dumps(dict(event="identity_rejected", error_type=type(error).__name__)))
-        raise AppError(401, "invalid_session", "Invalid session") from None
-    if (not isinstance(user, Identity) or not user.active or not user.subject or
-            not user.plant_id or user.role not in {"Operator", "Engineer", "Manager"}):
-        raise AppError(401, "invalid_session", "Invalid or inactive identity")
-    return user
+def request_context(request: Request) -> RequestContext:
+    """Obtain the request's role, plant scope and actor, or hold on D-35/D-36.
+
+    ``app.state.context_resolver`` is an injection point for a future, decided
+    mechanism. None exists, so the default is to refuse with 501 citing D-35 and
+    D-36. A resolver may raise ``AppError`` itself; whether requests without a
+    known role or actor are rejected is part of the held decisions.
+    """
+    resolver = request.app.state.context_resolver
+    if resolver is None:
+        held(*CONTEXT_QUESTIONS)
+    context = resolver(request)
+    if (not isinstance(context, RequestContext) or not context.actor or
+            not context.plant_id or context.role not in ROLES):
+        # A resolver contract violation is a server defect, not a client error.
+        raise AppError(500, "request_context_invalid", "Request context resolver returned invalid data")
+    return context
 
 
 # PUBLIC_INTERFACE
-def engineer(user: Annotated[Identity, Depends(identity)]):
+def engineer(context: Annotated[RequestContext, Depends(request_context)]):
     """Require the decided Engineer role before invoking a command."""
-    if user.role != "Engineer":
+    if context.role != "Engineer":
         raise AppError(403, "forbidden", "Engineer role required")
-    return user
+    return context
 
 
 # PUBLIC_INTERFACE
-def case_reader(user: Annotated[Identity, Depends(identity)]):
+def case_reader(context: Annotated[RequestContext, Depends(request_context)]):
     """Allow only Engineer and Manager case queries."""
-    if user.role not in {"Engineer", "Manager"}:
+    if context.role not in {"Engineer", "Manager"}:
         raise AppError(403, "forbidden", "Case access requires Engineer or Manager")
-    return user
+    return context
 
 
 # PUBLIC_INTERFACE
-def reading_writer(user: Annotated[Identity, Depends(identity)]):
+def reading_writer(context: Annotated[RequestContext, Depends(request_context)]):
     """Allow Operator and Engineer to log readings."""
-    if user.role not in {"Operator", "Engineer"}:
+    if context.role not in {"Operator", "Engineer"}:
         raise AppError(403, "forbidden", "Reading entry requires Operator or Engineer")
-    return user
+    return context
 
 
 # PUBLIC_INTERFACE
@@ -96,12 +98,12 @@ def database(request: Request):
 
 
 # PUBLIC_INTERFACE
-def execute(request: Request, user: Identity, key: str, payload: dict, operation):
+def execute(request: Request, context: RequestContext, key: str, payload: dict, operation):
     """Atomically replay or execute a command, detecting key/body mismatches."""
     fingerprint = hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     scope = hashlib.sha256(json.dumps([
-        user.plant_id, user.subject, user.role, request.method, request.url.path, key
+        context.plant_id, context.actor, context.role, request.method, request.url.path, key
     ]).encode()).hexdigest()
     with transaction(database(request), write=True) as session:
         receipt = session.get(CommandReceipt, scope)
@@ -112,25 +114,25 @@ def execute(request: Request, user: Identity, key: str, payload: dict, operation
         result = operation(session)
         session.add(CommandReceipt(
             scope=scope, fingerprint=fingerprint, result=result,
-            plant_id=user.plant_id, created_by=user.subject))
+            plant_id=context.plant_id, created_by=context.actor))
         session.flush()
         return Result(data=result)
 
 
 # PUBLIC_INTERFACE
-def collection(request: Request, user: Identity, model, offset: int, limit: int,
+def collection(request: Request, context: RequestContext, model, offset: int, limit: int,
                *conditions, order=(), view=serialize):
     """Query a scoped page without giving repositories commit ownership."""
     with transaction(database(request)) as session:
-        rows, total = Repository(session, user.plant_id).page(
+        rows, total = Repository(session, context.plant_id).page(
             model, offset, limit, *conditions, order=order)
         return Page(data=[view(row) for row in rows], total=total, offset=offset, limit=limit)
 
 
 Offset = Annotated[int, Query(ge=0)]
 Limit = Annotated[int, Query(ge=1, le=100)]
-User = Annotated[Identity, Depends(case_reader)]
-Engineer = Annotated[Identity, Depends(engineer)]
+User = Annotated[RequestContext, Depends(case_reader)]
+Engineer = Annotated[RequestContext, Depends(engineer)]
 Key = Annotated[str, Depends(command_key)]
 
 
@@ -155,7 +157,7 @@ def list_machines(request: Request, user: User, offset: Offset = 0, limit: Limit
 @router.get("/machines/{identifier}", tags=["Equipment"], response_model=Result,
             summary="Equipment detail", description="Include derived status and nonpersisted runtime counter.")
 def get_machine(request: Request, identifier: str, user: User):
-    """Return one machine by internal UUID in the authenticated plant."""
+    """Return one machine by internal UUID in the request context's plant."""
     with transaction(database(request)) as session:
         return Result(data=equipment.machine_detail(session, user, identifier))
 
@@ -212,7 +214,7 @@ def threshold(request: Request, identifier: str, body: ThresholdInput, user: Eng
 @router.post("/readings", tags=["Readings"], response_model=Result, status_code=201,
              summary="Log one reading", description="Validate, detect and consolidate alerts in one durable transaction.")
 def log_reading(request: Request, body: ReadingInput,
-                user: Annotated[Identity, Depends(reading_writer)], key: Key):
+                user: Annotated[RequestContext, Depends(reading_writer)], key: Key):
     """Accept one parameter value; return saved reading and associated alert ID."""
     return execute(request, user, key, body.model_dump(mode="json"), lambda session:
                    readings.log_reading(session, user, body, request.app.state.rules))
@@ -356,7 +358,7 @@ def addendum(identifier: str, user: Engineer, key: Key):
 # PUBLIC_INTERFACE
 @router.get("/dashboard", tags=["Dashboard"], response_model=Result,
             summary="Dashboard (held)", description="Location/type composition awaits definition of open work orders.")
-def dashboard(user: Annotated[Identity, Depends(identity)],
+def dashboard(user: Annotated[RequestContext, Depends(request_context)],
               location: str | None = None, equipment_type: str | None = None):
     """Expose Manager prerequisite without granting undecided access to other roles."""
     if user.role != "Manager":

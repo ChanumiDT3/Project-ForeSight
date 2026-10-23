@@ -57,9 +57,13 @@ def transaction(engine, write=False):
 
 
 # PUBLIC_INTERFACE
-def attributes(identity):
-    """Create common persisted record attribution (UUID, plant, actor, UTC time)."""
-    return dict(id=str(uuid4()), plant_id=identity.plant_id, created_by=identity.subject,
+def attributes(context):
+    """Create common persisted record attribution (UUID, plant, actor, UTC time).
+
+    The actor's source is held on D-36; this helper only copies what the
+    request context supplies.
+    """
+    return dict(id=str(uuid4()), plant_id=context.plant_id, created_by=context.actor,
                 created_at=utcnow())
 
 

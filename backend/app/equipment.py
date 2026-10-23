@@ -38,7 +38,7 @@ def _parameter_spec(item, rules) -> dict:
 
 
 # PUBLIC_INTERFACE
-def register(session, identity, body, rules):
+def register(session, context, body, rules):
     """Register configured equipment atomically; held variants save nothing.
 
     All input is validated before the first write so a rejected request never
@@ -65,14 +65,14 @@ def register(session, identity, body, rules):
         specs.append(spec)
 
     if session.scalar(select(Machine.id).where(
-        Machine.plant_id == identity.plant_id,
+        Machine.plant_id == context.plant_id,
         Machine.equipment_id == body.equipment_id,
     )):
         raise AppError(409, "duplicate_id", "ID already exists")
 
     now = utcnow()
     machine = Machine(
-        **attributes(identity),
+        **attributes(context),
         equipment_id=body.equipment_id,
         name=body.name,
         location=body.location,
@@ -81,7 +81,7 @@ def register(session, identity, body, rules):
         baseline=plain(body.baseline) if runtime else None,
         # The registration meter is captured but not saved as a reading (D-12 residual).
         registration_meter=plain(body.current_meter) if runtime else None,
-        updated_by=identity.subject,
+        updated_by=context.actor,
         updated_at=now,
     )
     session.add(machine)
@@ -90,7 +90,7 @@ def register(session, identity, body, rules):
     parameters = []
     for item, spec in zip(body.parameters, specs):
         parameter = Parameter(
-            **attributes(identity),
+            **attributes(context),
             machine_id=machine.id,
             kind=item.kind,
             name=item.name,
@@ -98,7 +98,7 @@ def register(session, identity, body, rules):
             threshold_type="max",
             suggested_action=item.suggested_action,
             **spec,
-            updated_by=identity.subject,
+            updated_by=context.actor,
             updated_at=now,
         )
         session.add(parameter)
@@ -108,16 +108,16 @@ def register(session, identity, body, rules):
 
 
 # PUBLIC_INTERFACE
-def machine_detail(session, identity, identifier):
+def machine_detail(session, context, identifier):
     """Return equipment with derived alert status and nonpersistent runtime counter."""
-    repo = Repository(session, identity.plant_id)
+    repo = Repository(session, context.plant_id)
     machine = repo.get(Machine, identifier)
     parameters = session.scalars(select(Parameter).where(
         Parameter.machine_id == machine.id,
-        Parameter.plant_id == identity.plant_id,
+        Parameter.plant_id == context.plant_id,
     ).order_by(Parameter.created_at, Parameter.id)).all()
     active = session.scalars(select(Alert.id).where(
-        Alert.plant_id == identity.plant_id,
+        Alert.plant_id == context.plant_id,
         Alert.machine_id == machine.id,
         Alert.status.in_(ACTIVE_ALERT_STATES),
     )).all()
@@ -131,7 +131,7 @@ def machine_detail(session, identity, identifier):
         if parameter.kind == "runtime_hours":
             latest = session.scalar(select(Reading).where(
                 Reading.parameter_id == parameter.id,
-                Reading.plant_id == identity.plant_id,
+                Reading.plant_id == context.plant_id,
             ).order_by(Reading.created_at.desc(), Reading.id.desc()).limit(1))
             result["runtime_state"] = "Baseline missing" if machine.baseline is None else "Ready"
             # Derived on read only; whether it is stored is unresolved (D-19).
@@ -146,42 +146,42 @@ def machine_detail(session, identity, identifier):
 
 
 # PUBLIC_INTERFACE
-def edit_criticality(session, identity, identifier, body):
+def edit_criticality(session, context, identifier, body):
     """Change only future criticality evaluations, recording actor and time."""
-    machine = Repository(session, identity.plant_id).get(Machine, identifier)
+    machine = Repository(session, context.plant_id).get(Machine, identifier)
     machine.criticality = body.criticality
-    machine.updated_by, machine.updated_at = identity.subject, utcnow()
+    machine.updated_by, machine.updated_at = context.actor, utcnow()
     session.flush()
     return serialize(machine)
 
 
 # PUBLIC_INTERFACE
-def edit_details(session, identity, identifier, body):
+def edit_details(session, context, identifier, body):
     """Edit equipment descriptions without mutating existing alert snapshots."""
-    machine = Repository(session, identity.plant_id).get(Machine, identifier)
+    machine = Repository(session, context.plant_id).get(Machine, identifier)
     machine.name, machine.location = body.name, body.location
     machine.equipment_type = body.equipment_type
-    machine.updated_by, machine.updated_at = identity.subject, utcnow()
+    machine.updated_by, machine.updated_at = context.actor, utcnow()
     session.flush()
     return serialize(machine)
 
 
 # PUBLIC_INTERFACE
-def edit_suggested_action(session, identity, identifier, body):
+def edit_suggested_action(session, context, identifier, body):
     """Edit parameter guidance for subsequently created alerts."""
-    parameter = Repository(session, identity.plant_id).get(Parameter, identifier)
+    parameter = Repository(session, context.plant_id).get(Parameter, identifier)
     parameter.suggested_action = body.suggested_action
-    parameter.updated_by, parameter.updated_at = identity.subject, utcnow()
+    parameter.updated_by, parameter.updated_at = context.actor, utcnow()
     session.flush()
     return serialize(parameter)
 
 
 # PUBLIC_INTERFACE
-def edit_threshold(session, identity, identifier, body):
+def edit_threshold(session, context, identifier, body):
     """Change only future threshold evaluations without rewriting existing breaches."""
-    parameter = Repository(session, identity.plant_id).get(Parameter, identifier)
+    parameter = Repository(session, context.plant_id).get(Parameter, identifier)
     _check_threshold(body.threshold, dict(minimum=parameter.minimum, maximum=parameter.maximum))
     parameter.threshold = plain(body.threshold)
-    parameter.updated_by, parameter.updated_at = identity.subject, utcnow()
+    parameter.updated_by, parameter.updated_at = context.actor, utcnow()
     session.flush()
     return serialize(parameter)

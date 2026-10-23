@@ -11,17 +11,17 @@ ACTIVE_STATES = ("Open", "In Progress")
 
 
 # PUBLIC_INTERFACE
-def accept_breach(session, identity, machine, parameter, value, breakdown, timestamp):
+def accept_breach(session, context, machine, parameter, value, breakdown, timestamp):
     """Consolidate synchronously inside the reading transaction; no lossy callbacks."""
     alert = session.scalar(select(Alert).where(
-        Alert.plant_id == identity.plant_id,
+        Alert.plant_id == context.plant_id,
         Alert.machine_id == machine.id,
         Alert.parameter_id == parameter.id,
         Alert.status.in_(ACTIVE_STATES),
     ))
     if alert is None:
         alert = Alert(
-            **attributes(identity),
+            **attributes(context),
             machine_id=machine.id,
             parameter_id=parameter.id,
             status="Open",
@@ -35,7 +35,7 @@ def accept_breach(session, identity, machine, parameter, value, breakdown, times
             suggested_action=parameter.suggested_action.strip()
             or f"Inspect {machine.name} – {parameter.name} above safe limit",
             version=1,
-            updated_by=identity.subject,
+            updated_by=context.actor,
             updated_at=timestamp,
         )
         # The alert is created at the same instant as the breaching reading.
@@ -50,7 +50,7 @@ def accept_breach(session, identity, machine, parameter, value, breakdown, times
         alert.breakdown = breakdown if breakdown["priority_score"] >= alert.priority_score else None
         alert.priority_score = max(alert.priority_score, breakdown["priority_score"])
         alert.version += 1
-        alert.updated_by, alert.updated_at = identity.subject, timestamp
+        alert.updated_by, alert.updated_at = context.actor, timestamp
     session.flush()
     return alert
 
@@ -67,14 +67,14 @@ def alert_view(alert):
 
 
 # PUBLIC_INTERFACE
-def dismiss(session, identity, identifier, reason, version):
+def dismiss(session, context, identifier, reason, version):
     """Dismiss only an Open alert with no active work order using optimistic version."""
-    repo = Repository(session, identity.plant_id)
+    repo = Repository(session, context.plant_id)
     alert = repo.get(Alert, identifier)
     if alert.version != version:
         raise AppError(409, "stale_version", "Alert version has changed")
     active_work = session.scalar(select(WorkOrder.id).where(
-        WorkOrder.plant_id == identity.plant_id,
+        WorkOrder.plant_id == context.plant_id,
         WorkOrder.alert_id == identifier,
         WorkOrder.status.in_(ACTIVE_STATES),
     ))
@@ -85,7 +85,7 @@ def dismiss(session, identity, identifier, reason, version):
             "Only an Open alert without active work can be dismissed",
         )
     alert.status, alert.dismissal_reason = "Dismissed", reason
-    alert.updated_by, alert.updated_at = identity.subject, utcnow()
+    alert.updated_by, alert.updated_at = context.actor, utcnow()
     alert.version += 1
     session.flush()
     return alert_view(alert)

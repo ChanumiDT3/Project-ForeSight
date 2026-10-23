@@ -11,9 +11,9 @@ from app.storage import Repository, attributes, serialize
 
 
 # PUBLIC_INTERFACE
-def log_reading(session, identity, body, rules):
+def log_reading(session, context, body, rules):
     """Validate and save one immutable reading, breach and alert in one transaction."""
-    repo = Repository(session, identity.plant_id)
+    repo = Repository(session, context.plant_id)
     parameter = repo.get(Parameter, body.parameter_id)
     machine = repo.get(Machine, parameter.machine_id)
     if parameter.kind == "custom":
@@ -23,7 +23,7 @@ def log_reading(session, identity, body, rules):
     validate_value(body.value, parameter.minimum, parameter.maximum, parameter.precision, parameter.unit)
     latest = session.scalar(select(Reading).where(
         Reading.parameter_id == parameter.id,
-        Reading.plant_id == identity.plant_id,
+        Reading.plant_id == context.plant_id,
     ).order_by(Reading.created_at.desc(), Reading.id.desc()).limit(1))
     if parameter.cumulative and latest and body.value < Decimal(latest.value):
         raise AppError(422, "decreasing_reading", "Cumulative readings cannot decrease")
@@ -37,7 +37,7 @@ def log_reading(session, identity, body, rules):
         compared -= Decimal(machine.baseline)
 
     reading = Reading(
-        **attributes(identity),
+        **attributes(context),
         machine_id=machine.id,
         parameter_id=parameter.id,
         value=plain(body.value),
@@ -54,9 +54,9 @@ def log_reading(session, identity, body, rules):
             machine.criticality,
             rules["exceedance_bands"],
         )
-        alert = accept_breach(session, identity, machine, parameter, compared, breakdown, reading.created_at)
+        alert = accept_breach(session, context, machine, parameter, compared, breakdown, reading.created_at)
         breach = Breach(
-            **attributes(identity),
+            **attributes(context),
             reading_id=reading.id,
             machine_id=machine.id,
             parameter_id=parameter.id,
