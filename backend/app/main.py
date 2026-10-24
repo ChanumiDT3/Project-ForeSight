@@ -16,6 +16,7 @@ from starlette.exceptions import HTTPException
 from app.api import public_router, router
 from app.core import USER_ID_HEADER, AppError
 from app.schemas import Problem
+from app.seed_equipment import seed_equipment_if_empty
 from app.seed_users import seed_users_if_empty
 from app.settings import load_environment
 from app.storage import make_engine
@@ -64,18 +65,45 @@ def _seed_initial_users(app: FastAPI) -> None:
         logger.warning(json.dumps({"event": "user_seed_loaded", "created": summary["created"]}))
 
 
+def _seed_initial_equipment(app: FastAPI) -> None:
+    """Register seed/equipment.json machines when the plant has none.
+
+    The Log Reading screen only lists parameters configured on registered
+    machines, so a fresh database would otherwise show an empty Parameter
+    dropdown. Failures are logged and never stop the API from starting;
+    ``python -m app.seed_equipment`` remains available.
+    """
+    engine, plant_id = app.state.engine, app.state.plant_id
+    if not app.state.seed_equipment_on_startup or engine is None:
+        return
+    if not isinstance(plant_id, str) or not plant_id:
+        return
+    try:
+        summary = seed_equipment_if_empty(engine, plant_id, rules=app.state.rules)
+    except (OSError, ValueError, SQLAlchemyError) as error:
+        logger.warning(json.dumps({"event": "equipment_seed_skipped", "reason": str(error)}))
+        return
+    if summary:
+        logger.warning(json.dumps({"event": "equipment_seed_loaded", "created": summary["created"]}))
+
+
 # PUBLIC_INTERFACE
-def create_app(database_url=None, plant_id=None, cors_origins=None, seed_users_on_startup=None):
+def create_app(database_url=None, plant_id=None, cors_origins=None, seed_users_on_startup=None,
+               seed_equipment_on_startup=None):
     """Build the FastAPI application from explicit environment-backed configuration.
 
     ``seed_users_on_startup`` (env FORESIGHT_SEED_USERS_ON_STARTUP, default on)
     loads seed/users.json at startup when the configured plant has no users.
+    ``seed_equipment_on_startup`` (env FORESIGHT_SEED_EQUIPMENT_ON_STARTUP,
+    default on) registers seed/equipment.json machines when the plant has none.
     """
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         """Prepare startup data before serving requests."""
+        # Users first: seeded equipment is attributed to a seeded Engineer.
         _seed_initial_users(application)
+        _seed_initial_equipment(application)
         yield
 
     app = FastAPI(
@@ -107,6 +135,11 @@ def create_app(database_url=None, plant_id=None, cors_origins=None, seed_users_o
         seed_users_on_startup
         if seed_users_on_startup is not None
         else os.getenv("FORESIGHT_SEED_USERS_ON_STARTUP")
+    )
+    app.state.seed_equipment_on_startup = _enabled(
+        seed_equipment_on_startup
+        if seed_equipment_on_startup is not None
+        else os.getenv("FORESIGHT_SEED_EQUIPMENT_ON_STARTUP")
     )
     app.state.rules = json.loads(Path(__file__).with_name("rules.json").read_text())
     app.state.operational_recipient = os.getenv("FORESIGHT_OPERATIONAL_RECIPIENT")

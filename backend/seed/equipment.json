@@ -1,0 +1,20 @@
+{
+  "source": "kavia-docs/CodeWiki/Specs/FeatureSpecs/UI-Wireframes.md sections 6 (S2), 7 (S3) and 12 (S8). Illustrative development data, not business values.",
+  "registered_by": "u-raj",
+  "machines": [
+    {
+      "equipment_id": "M-100",
+      "name": "Press 1",
+      "location": "Line A",
+      "equipment_type": "Press",
+      "criticality": 3,
+      "baseline": "5000.0",
+      "current_meter": "5100.0",
+      "parameters": [
+        {"kind": "temperature", "name": "Temperature", "threshold": "80", "suggested_action": "Check coolant"},
+        {"kind": "vibration", "name": "Vibration", "threshold": "12", "suggested_action": "Inspect mounts"},
+        {"kind": "runtime_hours", "name": "Runtime hours", "threshold": "100", "suggested_action": "Service due"}
+      ]
+    }
+  ]
+}
