@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, inspect, select
 
 from app.core import ROLES, utcnow
 from app.models import User
@@ -105,6 +105,30 @@ def seed_users(engine, plant_id: str, records) -> dict:
         ]
 
     return {"created": created, "updated": updated, "unlisted": sorted(unlisted)}
+
+
+# PUBLIC_INTERFACE
+def seed_users_if_empty(engine, plant_id: str, source: Path = DEFAULT_SEED) -> dict | None:
+    """Populate the user list from the seed file only when the plant has no users.
+
+    Used at application startup so a fresh local database is ready for the
+    identity popup. Existing user directories are never modified here.
+
+    Returns the ``seed_users`` summary when users were created, or ``None``
+    when the plant already has users. Raises ``ValueError`` when the users
+    table does not exist yet (migrations not applied) or the seed file is
+    invalid, and ``OSError`` when the seed file cannot be read.
+    """
+    if not inspect(engine).has_table(User.__tablename__):
+        raise ValueError("The users table does not exist; run 'alembic upgrade head' first")
+    with transaction(engine) as session:
+        existing = session.scalar(
+            select(func.count()).select_from(User).where(User.plant_id == plant_id)
+        )
+    if existing:
+        return None
+    records = json.loads(source.read_text(encoding="utf-8"))
+    return seed_users(engine, plant_id, records)
 
 
 # PUBLIC_INTERFACE

@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,15 +10,19 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from starlette.exceptions import HTTPException
 
 from app.api import public_router, router
 from app.core import USER_ID_HEADER, AppError
 from app.schemas import Problem
+from app.seed_users import seed_users_if_empty
 from app.storage import make_engine
 
 logger = logging.getLogger("foresight")
+
+# Values of FORESIGHT_SEED_USERS_ON_STARTUP that disable startup seeding.
+_DISABLED = {"0", "false", "no", "off"}
 
 
 def _origins(value):
@@ -29,12 +34,53 @@ def _origins(value):
     return [origin.strip().rstrip("/") for origin in value if origin and origin.strip()]
 
 
+def _enabled(value, default=True) -> bool:
+    """Interpret a boolean flag from an argument or environment string."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in _DISABLED
+
+
+def _seed_initial_users(app: FastAPI) -> None:
+    """Fill an empty user list from seed/users.json so the identity popup has choices.
+
+    Failures (missing tables, unreadable seed file) are logged and never stop
+    the API from starting; ``python -m app.seed_users`` remains available.
+    """
+    engine, plant_id = app.state.engine, app.state.plant_id
+    if not app.state.seed_users_on_startup or engine is None:
+        return
+    if not isinstance(plant_id, str) or not plant_id:
+        return
+    try:
+        summary = seed_users_if_empty(engine, plant_id)
+    except (OSError, ValueError, SQLAlchemyError) as error:
+        logger.warning(json.dumps({"event": "user_seed_skipped", "reason": str(error)}))
+        return
+    if summary:
+        logger.warning(json.dumps({"event": "user_seed_loaded", "created": summary["created"]}))
+
+
 # PUBLIC_INTERFACE
-def create_app(database_url=None, plant_id=None, cors_origins=None):
-    """Build the FastAPI application from explicit environment-backed configuration."""
+def create_app(database_url=None, plant_id=None, cors_origins=None, seed_users_on_startup=None):
+    """Build the FastAPI application from explicit environment-backed configuration.
+
+    ``seed_users_on_startup`` (env FORESIGHT_SEED_USERS_ON_STARTUP, default on)
+    loads seed/users.json at startup when the configured plant has no users.
+    """
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        """Prepare startup data before serving requests."""
+        _seed_initial_users(application)
+        yield
+
     app = FastAPI(
         title="ForeSight Maintenance API",
         version="0.2.0",
+        lifespan=lifespan,
         description=(
             "Predictive-maintenance MVP backend. There is no sign-in flow: the "
             "frontend selects an active user from public GET /v1/users and sends "
@@ -56,6 +102,11 @@ def create_app(database_url=None, plant_id=None, cors_origins=None):
     url = database_url or os.getenv("FORESIGHT_DATABASE_URL")
     app.state.engine = make_engine(url) if url else None
     app.state.plant_id = plant_id or os.getenv("FORESIGHT_PLANT_ID")
+    app.state.seed_users_on_startup = _enabled(
+        seed_users_on_startup
+        if seed_users_on_startup is not None
+        else os.getenv("FORESIGHT_SEED_USERS_ON_STARTUP")
+    )
     app.state.rules = json.loads(Path(__file__).with_name("rules.json").read_text())
     app.state.operational_recipient = os.getenv("FORESIGHT_OPERATIONAL_RECIPIENT")
 
