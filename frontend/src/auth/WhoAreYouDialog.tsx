@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Alert, Button, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, Stack, TextField } from '@mui/material';
-import { ApiError } from '../api/client';
+import { ApiError, SERVER_UNREACHABLE_CODE } from '../api/client';
 import { listActiveUsers } from '../api/endpoints';
 import type { UserChoice } from '../api/types';
 import { landingFor } from '../navigation/roles';
@@ -13,8 +13,8 @@ export const WHO_ARE_YOU_TITLE = 'Let us know who you are!';
 
 /** Message used when the public user list endpoint itself cannot be found. */
 export const USER_LIST_UNREACHABLE_MESSAGE =
-  'The user list could not be loaded because the ForeSight server was not found. ' +
-  'Make sure the backend is running and that the frontend proxy (VITE_BACKEND_PROXY_TARGET) points to it.';
+  'The user list could not be loaded because the ForeSight server could not be reached. ' +
+  'Make sure the backend is running (port 3001) and that the frontend proxy (VITE_BACKEND_PROXY_TARGET) points to it.';
 
 /** Message used when the server answered but has no active users yet. */
 export const NO_USERS_MESSAGE =
@@ -25,6 +25,8 @@ function loadErrorMessage(error: unknown): string {
   // record is missing". It means the request did not reach the ForeSight
   // backend (for example, the Vite dev proxy is not configured).
   if (error instanceof ApiError && error.status === 404) return USER_LIST_UNREACHABLE_MESSAGE;
+  // A non-ForeSight 5xx means the dev proxy could not connect to the backend.
+  if (error instanceof ApiError && error.code === SERVER_UNREACHABLE_CODE) return USER_LIST_UNREACHABLE_MESSAGE;
   return errorMessage(error);
 }
 

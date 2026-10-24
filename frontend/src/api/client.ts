@@ -63,9 +63,23 @@ function url(path: string, query?: Record<string, QueryValue>): string {
   return `${config.baseUrl}${path}${params.size ? `?${params}` : ''}`;
 }
 
+/** Error code used when a 5xx response did not come from the ForeSight API itself. */
+export const SERVER_UNREACHABLE_CODE = 'server_unreachable';
+
+/** User-facing detail for {@link SERVER_UNREACHABLE_CODE}. */
+export const SERVER_UNREACHABLE_DETAIL =
+  'The ForeSight server could not be reached. Make sure the backend is running and try again.';
+
 async function problem(response: Response): Promise<ApiError> {
   const body = await response.json().catch(() => ({})) as Record<string, unknown>;
   const { type: _type, title, status: _status, detail, instance: _instance, correlation_id, ...extra } = body;
+  // The ForeSight API always answers errors with a problem body that has a
+  // `title`. A 5xx without one comes from something in between, typically the
+  // Vite dev proxy failing to connect to the backend (empty text/plain 500).
+  // Report that clearly instead of a bare "Internal Server Error".
+  if (typeof title !== 'string' && response.status >= 500) {
+    return new ApiError(response.status, SERVER_UNREACHABLE_CODE, SERVER_UNREACHABLE_DETAIL);
+  }
   return new ApiError(
     response.status,
     typeof title === 'string' ? title : `http_${response.status}`,
