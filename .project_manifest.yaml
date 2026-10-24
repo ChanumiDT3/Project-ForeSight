@@ -22,7 +22,7 @@ containers:
     port: '3001'
     framework: fastapi
     type: ''
-    startCommand: set -a && . ./.env && set +a && .venv/bin/alembic upgrade head && .venv/bin/python -m app.seed_users && .venv/bin/uvicorn app.main:app --host <host> --port <port>
+    startCommand: .venv/bin/alembic upgrade head && .venv/bin/python -m app.seed_users && .venv/bin/uvicorn app.main:app --host <host> --port <port>
     buildCommand: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     installCommand: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     testCommand: .venv/bin/pytest -q

@@ -2,8 +2,11 @@
 import os
 from alembic import context
 from app.models import Base
+from app.settings import load_environment
 from app.storage import make_engine
 
+# Real environment variables win; otherwise backend/.env (or .env.example) is used.
+load_environment()
 url = os.environ.get("FORESIGHT_DATABASE_URL")
 if not url:
     raise RuntimeError("Request FORESIGHT_DATABASE_URL before running migrations")

@@ -17,6 +17,7 @@ from app.api import public_router, router
 from app.core import USER_ID_HEADER, AppError
 from app.schemas import Problem
 from app.seed_users import seed_users_if_empty
+from app.settings import load_environment
 from app.storage import make_engine
 
 logger = logging.getLogger("foresight")
@@ -229,4 +230,7 @@ def create_app(database_url=None, plant_id=None, cors_origins=None, seed_users_o
     return app
 
 
+# Read backend/.env (or the committed .env.example defaults) before building the
+# served app, so `uvicorn app.main:app` works without exporting variables first.
+load_environment()
 app = create_app()

@@ -8,6 +8,7 @@ from sqlalchemy import func, inspect, select
 
 from app.core import ROLES, utcnow
 from app.models import User
+from app.settings import load_environment
 from app.storage import make_engine, transaction
 
 DEFAULT_SEED = Path(__file__).resolve().parent.parent / "seed" / "users.json"
@@ -136,6 +137,8 @@ def main(argv=None) -> int:
     """Execute the seed-file import and return a conventional process exit code."""
     arguments = sys.argv[1:] if argv is None else argv
     source = Path(arguments[0]) if arguments else DEFAULT_SEED
+    # Real environment variables win; otherwise backend/.env (or .env.example).
+    load_environment()
     database_url = os.getenv("FORESIGHT_DATABASE_URL")
     plant_id = os.getenv("FORESIGHT_PLANT_ID")
 
