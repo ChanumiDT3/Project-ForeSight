@@ -1,20 +1,58 @@
 """SQLite resource management, record helpers and plant-scoped repository queries."""
+import logging
 from contextlib import contextmanager
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import create_engine, event, select, func
 from sqlalchemy.orm import Session
 from app.core import AppError, utcnow
 
+logger = logging.getLogger("foresight")
+
 # Connection execution option selecting the write lock protocol for a transaction.
 _WRITE = "foresight_write"
+_SQLITE_PREFIX = "sqlite:///"
+
+
+# PUBLIC_INTERFACE
+def ensure_sqlite_directory(url: str) -> Path | None:
+    """Create the parent directory of a file-backed ``sqlite:///`` database.
+
+    SQLite creates a missing database *file* but not its directory. Without
+    this, a configured location such as ``sqlite:////data/foresight.db`` on a
+    fresh machine makes ``alembic upgrade head`` fail with "unable to open
+    database file"; the startup chain then stops before uvicorn runs, and the
+    frontend reports that the ForeSight server could not be reached.
+
+    Returns the directory that was ensured, or ``None`` for in-memory or
+    non-file URLs. Failures to create it are logged and left to SQLite to
+    report on first connection, so engine creation itself never raises here.
+    """
+    if not url.startswith(_SQLITE_PREFIX):
+        return None
+    location = url[len(_SQLITE_PREFIX):].split("?", 1)[0]
+    if not location or location.startswith(":memory:") or location.startswith("file:"):
+        return None
+    directory = Path(location).parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        logger.warning("Could not create SQLite database directory %s: %s", directory, error)
+        return None
+    return directory
 
 
 # PUBLIC_INTERFACE
 def make_engine(url: str):
-    """Create the selected local SQLite engine; deployment storage is not provisioned."""
-    if not url.startswith("sqlite:///"):
+    """Create the selected local SQLite engine; deployment storage is not provisioned.
+
+    The database file's parent directory is created first (see
+    ``ensure_sqlite_directory``) so a fresh location never blocks startup.
+    """
+    if not url.startswith(_SQLITE_PREFIX):
         raise ValueError("This scaffold supports SQLite only; configure sqlite:///path")
+    ensure_sqlite_directory(url)
     engine = create_engine(url, connect_args={"check_same_thread": False, "timeout": 30})
 
     @event.listens_for(engine, "connect")
