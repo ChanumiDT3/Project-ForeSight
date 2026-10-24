@@ -13,4 +13,74 @@ knowledge_exclude_dirs:
   - dist
   - build
   - .git
-containers: []
+containers:
+  - container_name: foresight_backend
+    description: FastAPI + SQLite backend for the ForeSight predictive-maintenance MVP (machines, readings, alerts, work orders, dashboard).
+    interfaces: REST/JSON API. Public GET /health and GET /v1/users; all other routes under /v1 require the X-User-ID header (no sign-in). OpenAPI at /openapi.json, Swagger UI at /docs.
+    workspace: Project-ForeSight
+    container_root: Project-ForeSight/backend
+    port: '3001'
+    framework: fastapi
+    type: ''
+    startCommand: set -a && . ./.env && set +a && .venv/bin/alembic upgrade head && .venv/bin/python -m app.seed_users && .venv/bin/uvicorn app.main:app --host <host> --port <port>
+    buildCommand: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    installCommand: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    testCommand: .venv/bin/pytest -q
+    lintCommand: .venv/bin/python -m compileall -q app
+    lintConfig: ''
+    generateOpenapiCommand: ''
+    dependent_containers: []
+    routes:
+      - path: /docs
+        endpoint: Swagger UI
+    apiSpec: ''
+    container_details:
+      endpoints:
+        - GET /health - Health check
+        - GET /v1/users - List active users for the identity popup
+        - GET /v1/me - Current user resolved from X-User-ID
+        - GET/POST/PATCH /v1/machines - Machine register, list, detail, status, criticality and parameters
+        - PATCH /v1/parameters/{id}/threshold|cumulative|suggested-action - Parameter configuration
+        - GET /v1/readings/targets, POST /v1/readings - Reading entry; GET /v1/parameters/{id}/readings - history
+        - GET /v1/alerts, GET /v1/alerts/{id}, GET /v1/alerts/{id}/breaches, POST /v1/alerts/{id}/dismissal - Alert queue
+        - POST /v1/alerts/{id}/work-orders, GET/PATCH /v1/work-orders, start/cancellation/parts-checklist/closure/addenda - Work-order lifecycle
+        - GET /v1/dashboard - Engineer and Manager overview
+      validation:
+        - FORESIGHT_DATABASE_URL must be a sqlite:/// URL; FORESIGHT_PLANT_ID must be set
+        - Unknown or deactivated users receive 401; roles without permission receive 403
+  - container_name: foresight_frontend
+    description: React + TypeScript + Vite + Material UI frontend for ForeSight.
+    interfaces: Web UI. The Vite dev server proxies /v1 and /health to foresight_backend (VITE_BACKEND_PROXY_TARGET in .env).
+    workspace: Project-ForeSight
+    container_root: Project-ForeSight/frontend
+    port: '3000'
+    framework: react
+    type: ''
+    visual_edit_enabled: false
+    startCommand: npm run dev -- --port <port> --host <host>
+    buildCommand: npm install && npm run build
+    installCommand: npm install
+    testCommand: npm test
+    lintCommand: npm run lint
+    lintConfig: ''
+    dependent_containers:
+      - foresight_backend
+    routes:
+      - path: /
+        endpoint: App home
+    container_details:
+      features:
+        - Who-are-you user selection (no sign-in)
+        - Machines register, detail and edit
+        - Reading entry
+        - Alert queue and alert detail
+        - Work orders with planning, checklist, closure and addenda
+        - Dashboard
+      colors:
+        primary: '#1f4e79'
+        secondary: '#00897b'
+        accent: '#00897b'
+        background: '#f4f6f9'
+      theme: light
+      layout_description: App shell with role-based navigation and page content area
+      style: modern, minimalistic (Material UI)
